@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>🍅 토마토 V100.1 PAY</title>
+<title>🍅 토마토 V100.4 새벽시간</title>
 <style>
 :root{
   --bg:#0b0d12; --card:#171d2b; --card2:#202637; --text:#f7f8fc; --muted:#9aa4b5;
@@ -579,7 +579,7 @@ window.normalizeAutoStaffPay = window.normalizeAutoStaffPay || function(){};
 </head>
 <body>
 <div class="top">
-<h1>🍅 토마토 🍅 <small style="font-size:10px;color:#ffd166">V100.1 PAY</small></h1>
+<h1>🍅 토마토 🍅 <small style="font-size:10px;color:#ffd166">V100.4 새벽시간</small></h1>
 <input id="ledgerTitle" class="titleInput" value="5월28일 목">
 <div class="summary">
 <div class="sum"><span>건수</span><b id="totalCount">0</b></div>
@@ -4340,6 +4340,365 @@ makeBackup?.('열기');updateSafeInfo();updateSpecialShopInput?.();updateQuickDu
 })();
 </script>
 <!-- TOMATO_STAFF_HALF_PAIR_PATCH_END -->
+
+
+<!-- TOMATO_RECEIPT_PERF_PATCH_START -->
+<script>
+(function(){
+  if(window.__tomatoReceiptPerfPatchLoaded) return;
+  window.__tomatoReceiptPerfPatchLoaded = true;
+
+  const MAX_RECEIPTS_KEEP = 80;
+  const MAX_RECEIPTS_RENDER = 20;
+
+  function _receiptList(){
+    const d = (typeof cur === 'function') ? cur() : null;
+    if(!d) return [];
+    if(!Array.isArray(d.receipts)) d.receipts = [];
+    // 너무 오래 쌓인 수금기록은 렌더링/계산을 느리게 만들어서 최근 기록만 유지
+    if(d.receipts.length > MAX_RECEIPTS_KEEP){
+      d.receipts = d.receipts.slice(-MAX_RECEIPTS_KEEP);
+    }
+    return d.receipts;
+  }
+
+  try{
+    ensureReceipts = function(){
+      return _receiptList();
+    };
+  }catch(e){
+    window.ensureReceipts = function(){
+      return _receiptList();
+    };
+  }
+
+  function _cleanShopKey(s){
+    return String(s||'').replace(/\s/g,'').replace(/미수/g,'').trim();
+  }
+
+  // 계산 최적화: 활성 미수 가게 + 최근 수금내역만 계산
+  try{
+    collectReceivablesByShop = function(){
+      const map = {};
+      let totalCount = 0, totalShop = 0, totalStaff = 0;
+      const activeShopKeys = {};
+
+      cur().employees.forEach(emp=>{
+        if(emp.off) return;
+        (emp.rows||[]).forEach(r=>{
+          if(!isDueRow(r)) return;
+          const shop = (r.shop || '가게미입력').trim();
+          const key = _cleanShopKey(shop);
+          activeShopKeys[key] = true;
+
+          const count = rowCount(r);
+          const shopPay = finalShopPay(r);
+          const staffPay = finalStaffPay(r);
+
+          totalCount += count;
+          totalShop += shopPay;
+          totalStaff += staffPay;
+
+          if(!map[shop]) map[shop] = {count:0, shopPay:0, staffPay:0, received:0, remain:0};
+          map[shop].count += count;
+          map[shop].shopPay += shopPay;
+          map[shop].staffPay += staffPay;
+        });
+      });
+
+      // 오래된 수금내역 전체를 화면에 계속 끌고 오지 않음.
+      // 단, 현재 미수 가게와 관련된 기록은 계산에 반영.
+      ensureReceipts().forEach(p=>{
+        const shop = (p.shop || '가게미입력').trim();
+        const key = _cleanShopKey(shop);
+        if(!activeShopKeys[key] && p.type === 'full') return;
+
+        if(!map[shop]) map[shop] = {count:0, shopPay:0, staffPay:0, received:0, remain:0};
+        map[shop].received += Number(p.amount || 0);
+      });
+
+      Object.values(map).forEach(v=>{
+        v.remain = Math.max(0, v.shopPay - v.received);
+      });
+
+      const totalReceived = Object.values(map).reduce((s,v)=>s+v.received,0);
+      const totalRemain = Object.values(map).reduce((s,v)=>s+v.remain,0);
+      return {map,totalCount,totalShop,totalStaff,totalReceived,totalRemain};
+    };
+  }catch(e){}
+
+  // 수금 후 전체 렌더가 너무 무거울 때도 버티도록 수금내역 자동 정리
+  const _oldReceiveDue = window.receiveDue;
+  try{
+    receiveDue = function(shop, mode){
+      if(typeof _oldReceiveDue === 'function'){
+        _oldReceiveDue(shop, mode);
+      }
+      const list = ensureReceipts();
+      if(list.length > MAX_RECEIPTS_KEEP){
+        cur().receipts = list.slice(-MAX_RECEIPTS_KEEP);
+        try{ save(); }catch(e){}
+      }
+    };
+  }catch(e){
+    window.receiveDue = function(shop, mode){
+      if(typeof _oldReceiveDue === 'function') _oldReceiveDue(shop, mode);
+      const list = ensureReceipts();
+      if(list.length > MAX_RECEIPTS_KEEP){
+        cur().receipts = list.slice(-MAX_RECEIPTS_KEEP);
+        try{ save(); }catch(e){}
+      }
+    };
+  }
+
+  // 수금표 렌더링에서 수금내역은 최근 20개만 보여줌
+  const _oldRenderReceivableSummary = window.renderReceivableSummary;
+  try{
+    renderReceivableSummary = function(){
+      if(typeof _oldRenderReceivableSummary !== 'function') return;
+      _oldRenderReceivableSummary();
+
+      const box = document.getElementById('receivableSummary');
+      if(!box) return;
+
+      const receipts = ensureReceipts();
+      if(receipts.length > MAX_RECEIPTS_RENDER){
+        const lists = box.querySelectorAll('.finalGrid');
+        const lastGrid = lists[lists.length - 1];
+        if(lastGrid){
+          // 기존 출력이 길어져도 앱이 멈추지 않도록 안내문만 추가
+          const note = document.createElement('div');
+          note.style.gridColumn = '1 / -1';
+          note.style.color = '#ffd166';
+          note.style.fontSize = '11px';
+          note.style.padding = '7px 8px';
+          note.textContent = `수금내역은 최근 ${MAX_RECEIPTS_RENDER}개 중심으로 관리됩니다. 오래된 기록은 속도 보호를 위해 자동 정리됩니다.`;
+          lastGrid.appendChild(note);
+        }
+      }
+    };
+  }catch(e){}
+
+  // 이미 쌓여 있는 과다 수금내역을 즉시 정리
+  setTimeout(()=>{
+    try{
+      const list = ensureReceipts();
+      if(list.length > MAX_RECEIPTS_KEEP){
+        cur().receipts = list.slice(-MAX_RECEIPTS_KEEP);
+        save();
+        if(typeof renderReceivableSummary === 'function') renderReceivableSummary();
+      }
+    }catch(e){}
+  }, 700);
+})();
+</script>
+<!-- TOMATO_RECEIPT_PERF_PATCH_END -->
+
+
+<!-- TOMATO_FULL_RECEIPT_HIDE_PATCH_START -->
+<script>
+(function(){
+  if(window.__tomatoFullReceiptHidePatchLoaded) return;
+  window.__tomatoFullReceiptHidePatchLoaded = true;
+
+  function shopKey(s){
+    return String(s||'').replace(/\s/g,'').replace(/미수/g,'').trim();
+  }
+  function receiptList(){
+    const d = (typeof cur === 'function') ? cur() : null;
+    if(!d) return [];
+    if(!Array.isArray(d.receipts)) d.receipts = [];
+    return d.receipts;
+  }
+  function removeDueTextOnly(shop){
+    const target = shopKey(shop);
+    const d = (typeof cur === 'function') ? cur() : null;
+    if(!d || !d.quickText) return;
+
+    const next = String(d.quickText).split('\n').map(raw=>{
+      const t = raw.trim();
+      if(!t || !/^\d{3,4}\b/.test(t) || !/미수/.test(t)) return raw;
+
+      let parts = t.split(/\s+/).filter(Boolean);
+      let tail = /^\d{3,4}$/.test(parts[1]||'') ? parts.slice(2) : parts.slice(1);
+      tail = tail.filter(x=>x !== '미수');
+      if(tail.length && /^\d+(?:\.\d+)?(?:미수)?$/.test(tail[tail.length-1])) tail = tail.slice(0,-1);
+
+      if(shopKey(tail.join(' ')) === target){
+        return String(raw)
+          .replace(/(\d+(?:\.\d+)?)\s*미수/g, '$1')
+          .replace(/미수/g, '')
+          .replace(/[ \t]+/g, ' ')
+          .trim();
+      }
+      return raw;
+    }).join('\n');
+
+    d.quickText = next;
+    const qt = document.getElementById('quickText');
+    const mt = document.getElementById('quickModalText');
+    if(qt) qt.value = next;
+    if(mt) mt.value = next;
+    try{ updateQuickPreview?.(); updateQuickDurationPreview?.(); }catch(e){}
+  }
+
+  window.clearDueForShop = function(shop){
+    const target = shopKey(shop);
+    try{
+      cur().employees.forEach(emp=>{
+        (emp.rows || []).forEach(r=>{
+          if(shopKey(r.shop) === target && r.due){
+            r.due = false;
+            r.receivedDone = true;
+          }
+        });
+      });
+    }catch(e){}
+    removeDueTextOnly(shop);
+
+    // 전액수금 완료된 가게의 full 영수 기록은 화면에 남기지 않음
+    try{
+      cur().receipts = receiptList().filter(p => !(shopKey(p.shop) === target && p.type === 'full'));
+    }catch(e){}
+  };
+
+  window.collectReceivablesByShop = function(){
+    const map = {};
+    let totalCount = 0, totalShop = 0, totalStaff = 0;
+    const active = {};
+
+    try{
+      cur().employees.forEach(emp=>{
+        if(emp.off) return;
+        (emp.rows || []).forEach(r=>{
+          if(!isDueRow(r)) return;
+
+          const shop = (r.shop || '가게미입력').trim();
+          const key = shopKey(shop);
+          active[key] = true;
+
+          const count = rowCount(r);
+          const shopPay = finalShopPay(r);
+          const staffPay = finalStaffPay(r);
+
+          totalCount += count;
+          totalShop += shopPay;
+          totalStaff += staffPay;
+
+          if(!map[shop]) map[shop] = {count:0, shopPay:0, staffPay:0, received:0, remain:0};
+          map[shop].count += count;
+          map[shop].shopPay += shopPay;
+          map[shop].staffPay += staffPay;
+        });
+      });
+
+      receiptList().forEach(p=>{
+        const shop = (p.shop || '가게미입력').trim();
+        const key = shopKey(shop);
+
+        if(!active[key] && p.type === 'full') return;
+
+        if(!map[shop]) map[shop] = {count:0, shopPay:0, staffPay:0, received:0, remain:0};
+        map[shop].received += Number(p.amount || 0);
+      });
+
+      Object.keys(map).forEach(shop=>{
+        const v = map[shop];
+        v.remain = Math.max(0, v.shopPay - v.received);
+        if(v.remain <= 0 && v.shopPay > 0) delete map[shop];
+      });
+    }catch(e){}
+
+    const totalReceived = Object.values(map).reduce((s,v)=>s+v.received,0);
+    const totalRemain = Object.values(map).reduce((s,v)=>s+v.remain,0);
+    return {map,totalCount,totalShop,totalStaff,totalReceived,totalRemain};
+  };
+
+  window.receiveDue = function(shop, mode){
+    const r = collectReceivablesByShop();
+    const info = r.map[shop];
+    if(!info || info.remain <= 0){
+      alert('남은 미수가 없어요.');
+      return;
+    }
+
+    if(mode === 'part'){
+      const raw = prompt(`${shop} 부분 수금액을 입력하세요\n남은 미수: ${fmtWon(info.remain)}`, '');
+      if(raw === null) return;
+      let amount = moneyNum(raw);
+      if(!amount){ alert('금액을 입력해주세요.'); return; }
+      if(amount > info.remain) amount = info.remain;
+
+      receiptList().push({
+        shop: shop,
+        amount: amount,
+        date: typeof todayShort === 'function' ? todayShort() : '',
+        time: new Date().toISOString(),
+        type: 'part'
+      });
+    }else{
+      if(!confirm(`${shop} 미수 ${fmtWon(info.remain)} 전액 수금 처리할까요?`)) return;
+      clearDueForShop(shop);
+    }
+
+    try{ save(); }catch(e){}
+    try{ render(); }catch(e){ try{ renderReceivableSummary?.(); }catch(x){} }
+    try{ showCopyToast?.('💰 수금 처리 완료'); }catch(e){}
+  };
+
+  setTimeout(()=>{ try{ renderReceivableSummary?.(); }catch(e){} }, 300);
+})();
+</script>
+<!-- TOMATO_FULL_RECEIPT_HIDE_PATCH_END -->
+
+
+<!-- TOMATO_OVERNIGHT_DURATION_PATCH_START -->
+<script>
+(function(){
+  if(window.__tomatoOvernightDurationPatchLoaded) return;
+  window.__tomatoOvernightDurationPatchLoaded = true;
+
+  function rawClockMinutes(t){
+    t = String(t || '').replace(/\D/g,'').slice(0,4);
+    if(t.length !== 4) return null;
+    const hh = Number(t.slice(0,2));
+    const mm = Number(t.slice(2));
+    if(hh > 12 || mm > 59) return null;
+    return {hh, mm};
+  }
+
+  window.dur = function(start, end){
+    const s = rawClockMinutes(start);
+    const e = rawClockMinutes(end);
+    if(!s || !e) return null;
+
+    function baseMinutes(x){
+      if(x.hh === 12) return 24 * 60 + x.mm;
+      if(x.hh >= 7 && x.hh <= 11) return (x.hh + 12) * 60 + x.mm;
+      return (x.hh + 24) * 60 + x.mm;
+    }
+
+    let a = baseMinutes(s);
+    let b = baseMinutes(e);
+
+    if(s.hh >= 1 && s.hh <= 6 && e.hh >= 7 && e.hh <= 11){
+      b = (e.hh + 24) * 60 + e.mm;
+    }
+
+    let d = b - a;
+    if(d < 0) d += 1440;
+    if(d > 960) return null;
+    return d;
+  };
+
+  window.aiSuggestCount = function(start, end){
+    const d = window.dur(start, end);
+    if(d === null) return '1';
+    return String(Math.max(0, Math.round((d / 60) * 2) / 2)).replace('.0','');
+  };
+})();
+</script>
+<!-- TOMATO_OVERNIGHT_DURATION_PATCH_END -->
 
 </body>
 </html>
